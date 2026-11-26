@@ -59,17 +59,25 @@ async def log_http_traffic(request: Request, call_next):
     if request.url.query:
         full_path = f"{full_path}?{request.url.query}"
 
-    log_entry = (
-        f"[{now}]\n"
-        f"Client: {request.client.host if request.client else 'unknown'}\n"
-        f"Method: {request.method}\n"
-        f"Path: {full_path}\n"
-        f"RequestBody: {request_body_text}\n"
-        f"StatusCode: {response.status_code}\n"
-        f"ResponseBody: {response_body_text}\n"
-        f"{'=' * 80}\n"
-    )
-    _append_http_log(log_entry)
+    # Don't log the debug page itself, so it doesn't fill the log.
+    if not request.url.path.startswith("/__recent"):
+        # Show headers that tell us which AWS service the game is calling.
+        interesting = {
+            k: v for k, v in request.headers.items()
+            if k.lower() in ("x-amz-target", "content-type", "user-agent", "host")
+        }
+        log_entry = (
+            f"[{now}]\n"
+            f"Client: {request.client.host if request.client else 'unknown'}\n"
+            f"Method: {request.method}\n"
+            f"Path: {full_path}\n"
+            f"Headers: {json.dumps(interesting)}\n"
+            f"RequestBody: {request_body_text}\n"
+            f"StatusCode: {response.status_code}\n"
+            f"ResponseBody: {response_body_text}\n"
+            f"{'=' * 80}\n"
+        )
+        _append_http_log(log_entry)
 
     return response
 
@@ -93,6 +101,7 @@ async def startup_event():
 # Lambda routes (specific path pattern)
 app.include_router(lambda_router)
 
+
 @app.get("/__recent")
 async def recent_requests(key: str = "", n: int = 40):
     """Show the last n logged requests. Needs ?key=<DEBUG_KEY>."""
@@ -104,6 +113,24 @@ async def recent_requests(key: str = "", n: int = 40):
     sep = "=" * 80 + "\n"
     entries = HTTP_LOG_FILE.read_text(encoding="utf-8").split(sep)
     return Response(sep.join(entries[-(n + 1):]), media_type="text/plain")
+
+
+# ─── Startup checks the game makes before logging in ─────────────────
+
+async def handle_fetch_global_fatal_error(body: dict) -> dict:
+    """
+    The game calls this first, to ask "is there a server-wide error?".
+    Answer: no error, so the game carries on to log in.
+    """
+    return {"data": {}}
+
+
+# Exact routes the game hits on the API URL (matched case-insensitively,
+# anywhere in the path, so /v1/fetchGlobalFatalError works too).
+STARTUP_HANDLERS = [
+    ("fetchglobalfatalerror", handle_fetch_global_fatal_error),
+]
+
 
 # ─── Catch-all route ─────────────────────────────────────────────────
 
@@ -159,9 +186,12 @@ async def catch_all(request: Request, path: str = ""):
         body = json.loads(raw) if raw else {}
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        body = {}
 
     # ── 2. Lambda: path matches invocation pattern ──
-    m = re.match(r"^2015-03-31/functions/([^/]+)/invocations/?$", path)
+    # (search, not match, so a prefix like /v1/ or /a/ in front still works)
+    m = re.search(r"2015-03-31/functions/([^/]+)/invocations/?$", path)
     if m or "/lambda/" in auth or host.startswith("lambda"):
         fn = m.group(1) if m else (path or "unknown")
         print(f"Service: Lambda | function: {fn}")
@@ -173,7 +203,7 @@ async def catch_all(request: Request, path: str = ""):
     if (target and target.startswith("DynamoDB_")) or "/dynamodb/" in auth or host.startswith("dynamodb"):
         op = target.rsplit(".", 1)[-1] if "." in target else "?"
         tbl = body.get("TableName", "")
-        if not tbl and isinstance(body, dict):
+        if not tbl:
             ri = body.get("RequestItems", {})
             if isinstance(ri, dict) and ri:
                 tbl = ",".join(ri.keys())
@@ -189,10 +219,20 @@ async def catch_all(request: Request, path: str = ""):
             headers=headers,
         )
 
-    # ── 4. Direct API: path matches known handler ──
-    # This handles legacy direct endpoints like /questLogIntoAccount
-    from routers.lambda_router import HANDLER_TABLE
     fn_lower = path.lower()
+
+    # ── 4a. Startup checks (fetchGlobalFatalError, ...) ──
+    for match_str, handler in STARTUP_HANDLERS:
+        if match_str in fn_lower:
+            print(f"Service: Startup | route: {path} | handler: {handler.__name__}")
+            result = await handler(body)
+            print(f"→ 200 application/json")
+            print(f"{'='*60}\n")
+            return JSONResponse(content=result)
+
+    # ── 4b. Direct API: path matches known handler ──
+    # This handles direct endpoints like /questLogIntoAccount
+    from routers.lambda_router import HANDLER_TABLE
     for match_str, handler in HANDLER_TABLE:
         if match_str in fn_lower:
             print(f"Service: Direct API | route: {path} | handler: {handler.__name__}")
@@ -204,7 +244,13 @@ async def catch_all(request: Request, path: str = ""):
             print(f"{'='*60}\n")
             return JSONResponse(content=result)
 
-    # ── 5. Unknown — return empty JSON ──
+    # ── 5. Unknown API call — answer with an empty "data" so the game keeps going ──
+    if path and method != "GET":
+        print(f"Service: (unknown) {path} — returning {{\"data\": {{}}}}")
+        print(f"{'='*60}\n")
+        return JSONResponse(content={"data": {}})
+
+    # Plain browser visits (GET /, /favicon.ico, ...)
     print(f"Service: (unknown) — returning {{}}")
     print(f"{'='*60}\n")
     return JSONResponse(content={})
