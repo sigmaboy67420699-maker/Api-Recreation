@@ -93,6 +93,18 @@ async def startup_event():
 # Lambda routes (specific path pattern)
 app.include_router(lambda_router)
 
+@app.get("/__recent")
+async def recent_requests(key: str = "", n: int = 40):
+    """Show the last n logged requests. Needs ?key=<DEBUG_KEY>."""
+    secret = os.getenv("DEBUG_KEY", "")
+    if not secret or key != secret:
+        return JSONResponse(status_code=404, content={})
+    if not HTTP_LOG_FILE.exists():
+        return Response("No requests logged yet.", media_type="text/plain")
+    sep = "=" * 80 + "\n"
+    entries = HTTP_LOG_FILE.read_text(encoding="utf-8").split(sep)
+    return Response(sep.join(entries[-(n + 1):]), media_type="text/plain")
+
 # ─── Catch-all route ─────────────────────────────────────────────────
 
 @app.api_route("/", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
